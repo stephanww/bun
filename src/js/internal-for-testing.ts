@@ -723,8 +723,7 @@ export const memoryPressurePsiFilter: (armed: string, ...polls: string[]) => boo
   1,
 );
 
-// os.cpus() on Linux with /proc and /sys read from under `root`, so a test can
-// stage a CPU layout that the host does not have. undefined on other platforms.
+// os.cpus() on Linux with /proc and /sys read from under `root`. undefined on other platforms.
 export const linuxCpusFromRoot: (root: string) => import("node:os").CpuInfo[] | undefined = $newRustFunction(
   "node_os.rs",
   "jsLinuxCpusFromRoot",
