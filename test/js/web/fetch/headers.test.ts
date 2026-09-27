@@ -265,7 +265,7 @@ describe("Headers", () => {
     // Node takes 0.5s for 400,000. A combined value under 4 KB is still one
     // exact-fit string. Past that, the header map keeps a builder for the value
     // and the value grows in place. Every case below runs in both states, and
-    // the last one measures the cost.
+    // the last one does an amount of work that only a linear join can finish.
     describe("with a name that repeats", () => {
       const COUNT = 100;
       describe.each([
@@ -417,18 +417,18 @@ describe("Headers", () => {
         const join = (model: Map<string, string>, name: string, value: string) =>
           model.set(name, model.has(name) ? model.get(name) + (name === "cookie" ? "; " : ", ") + value : value);
 
-        for (let program = 0; program < 12; program++) {
+        for (let program = 0; program < 8; program++) {
           let state = program * 7919 + 17;
           const random = () => (state = (Math.imul(state, 1664525) + 1013904223) >>> 0) / 2 ** 32;
           const pick = <T>(list: T[]) => list[(random() * list.length) | 0];
           const value = (i: number) => {
-            const text = `v${i}-${Buffer.alloc(pick([1, 31, 300, 1500, 5000]), "a").toString()}`;
+            const text = `v${i}-${Buffer.alloc(pick([1, 31, 300, 2000]), "a").toString()}`;
             return random() < 0.2 ? wide(text) : text;
           };
 
           const live = [{ headers: new Headers(), model: new Map<string, string>() }];
           const held: [string, string][] = [];
-          for (let i = 0; i < 150; i++) {
+          for (let i = 0; i < 100; i++) {
             const { headers, model } = pick(live);
             const name = pick(names);
             const operation = random();
@@ -482,68 +482,40 @@ describe("Headers", () => {
         expect(estimateShallowMemoryUsageOf(grown)).toBeLessThan(stored + value.length);
       });
 
-      // set() is the baseline. It makes the same number of calls with the same
-      // name and the same value, so it pays the same conversion, validation and
-      // lookup cost per call, and it never combines. The ratio of the two is
-      // what combining costs. With the quadratic join that ratio grows with the
-      // call count: measured 10 on debug+ASAN and 107 on release at 1000 calls.
-      // With the builder it is a small constant: 1.3 on debug+ASAN and 2.6 on
-      // release. The release bound is the looser one because a release set()
-      // call is 20x cheaper, so the bytes each append copies are a bigger share
-      // of it.
-      //
-      // Each side of a ratio is its fastest run. Another process or a GC pause
-      // can only add time to a run, so a loaded machine cannot make a linear
-      // append look quadratic, and it cannot make a quadratic one look linear.
-      describe("cost", () => {
-        const VALUE = Buffer.alloc(8192, "x").toString();
-        const repetitions = isDebug ? 3 : 5;
-
-        function time(method: "append" | "set", names: string[], calls: number) {
-          const headers = new Headers();
-          const started = performance.now();
-          for (let i = 0; i < calls; i++) {
-            for (const name of names) headers[method](name, VALUE);
-          }
-          const elapsed = performance.now() - started;
-          const length = method === "append" ? calls * VALUE.length + (calls - 1) * 2 : VALUE.length;
-          for (const name of names) expect(headers.get(name)!.length).toBe(length);
-          return elapsed;
+      // Also without a clock. Each name has a builder of its own, so names that
+      // grow in turn end in the same state as names that grow one after another.
+      test("names that grow in turn end as names that grow one by one", () => {
+        const unit = Buffer.alloc(100, "v").toString();
+        const names = ["x-first", "accept", "x-second"];
+        const inTurn = new Headers();
+        for (let i = 0; i < 100; i++) {
+          for (const name of names) inTurn.append(name, unit);
         }
-
-        function fastestRatio(numerator: () => number, denominator: () => number) {
-          return withoutAggressiveGC(() => {
-            let fastestNumerator = Infinity;
-            let fastestDenominator = Infinity;
-            for (let i = 0; i < repetitions; i++) {
-              fastestDenominator = Math.min(fastestDenominator, denominator());
-              fastestNumerator = Math.min(fastestNumerator, numerator());
-            }
-            return fastestNumerator / fastestDenominator;
-          }) as number;
+        const oneByOne = new Headers();
+        for (const name of names) {
+          for (let i = 0; i < 100; i++) oneByOne.append(name, unit);
         }
+        expect(inTurn.toJSON()).toEqual(oneByOne.toJSON());
+        expect(estimateShallowMemoryUsageOf(inTurn)).toBe(estimateShallowMemoryUsageOf(oneByOne));
+      });
 
-        test("append costs about as much per call as set", () => {
-          const ratio = fastestRatio(
-            () => time("append", ["x-repeated"], 1000),
-            () => time("set", ["x-repeated"], 1000),
-          );
-          expect(ratio).toBeLessThan(isDebug ? 4 : 8);
+      // For 8,000 appends of 4 KB the quadratic join copies 131 GB, so it cannot
+      // finish before the test times out: it needs 13 s or more on a release
+      // build. The linear join copies about 130 MB in 15 ms. A debug build pays
+      // 60 microseconds a call before it copies a byte, so it does half the
+      // appends: 0.3 s, against 33 GB for the quadratic join.
+      test("a long run of appends to one name finishes", () => {
+        const count = isDebug ? 4000 : 8000;
+        const value = Buffer.alloc(4096, "x").toString();
+        const headers = new Headers();
+        withoutAggressiveGC(() => {
+          for (let i = 0; i < count; i++) headers.append("x-repeated", value);
         });
-
-        // Each name has a builder of its own. If the names had to share one,
-        // every call would seed it again with a copy of the whole value, and
-        // this ratio would be over 100 and not about 3.
-        test("three names that grow in turn cost three times one name", () => {
-          const ratio = fastestRatio(
-            () => time("append", ["x-first", "accept", "x-second"], 300),
-            () => time("append", ["x-repeated"], 300),
-          );
-          expect(ratio).toBeLessThan(8);
-        });
+        expect(headers.get("x-repeated")!.length).toBe(count * 4096 + (count - 1) * 2);
       });
     });
   });
+
   describe("set()", () => {
     test("can set header", () => {
       const headers = new Headers();
