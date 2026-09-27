@@ -397,23 +397,23 @@ const EMPH_DELIMS: ByteSet = ByteSet::of(b"*_~");
 const LEFT_BOUNDARY: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C({[");
 const RIGHT_BOUNDARY: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C)}]<.!?,;&");
 
-/// Which emphasis delimiters (*_~) next to a link are a boundary.
+/// When an emphasis delimiter (*_~) next to a link is a boundary.
 #[derive(Copy, Clone)]
-enum Delims<'a> {
-    /// Each of them, in front of a URL or WWW link: the link is found before emphasis is paired.
-    Bytes,
-    /// None of them, behind a URL or WWW link: `delimiter_in_tail` finds the run that ends a link.
-    None,
-    /// One whose run was paired (email).
-    Paired(&'a [EmphDelim]),
+enum DelimiterBoundary<'a> {
+    /// In front of a URL or WWW link, which is found before emphasis is paired.
+    Always,
+    /// Behind a URL or WWW link: `delimiter_in_tail` finds the run that ends the link.
+    Never,
+    /// Next to an email address, if its run was paired.
+    IfPaired(&'a [EmphDelim]),
 }
 
-impl Delims<'_> {
+impl DelimiterBoundary<'_> {
     fn is_boundary(self, at: usize) -> bool {
         match self {
-            Delims::Bytes => true,
-            Delims::None => false,
-            Delims::Paired(resolved) => is_paired_delimiter(resolved, at),
+            DelimiterBoundary::Always => true,
+            DelimiterBoundary::Never => false,
+            DelimiterBoundary::IfPaired(resolved) => is_paired_delimiter(resolved, at),
         }
     }
 }
@@ -443,7 +443,7 @@ fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
 }
 
 /// Check left boundary for permissive autolinks.
-fn check_left_boundary(content: &[u8], pos: usize, delims: Delims) -> bool {
+fn check_left_boundary(content: &[u8], pos: usize, delims: DelimiterBoundary) -> bool {
     if pos == 0 {
         return true;
     }
@@ -452,7 +452,7 @@ fn check_left_boundary(content: &[u8], pos: usize, delims: Delims) -> bool {
 }
 
 /// Check right boundary for permissive autolinks.
-fn check_right_boundary(content: &[u8], pos: usize, delims: Delims) -> bool {
+fn check_right_boundary(content: &[u8], pos: usize, delims: DelimiterBoundary) -> bool {
     if pos >= content.len() {
         return true;
     }
@@ -495,7 +495,7 @@ pub(crate) fn find_url_autolink(
                 && &content[pos + 1..pos + 1 + suflen] == scheme.suffix
             {
                 let beg = pos - slen;
-                if !check_left_boundary(content, beg, Delims::Bytes) {
+                if !check_left_boundary(content, beg, DelimiterBoundary::Always) {
                     continue;
                 }
                 if let Some(end) = scan_url_tail(content, beg, pos + 1 + suflen, 2, ctx) {
@@ -543,7 +543,7 @@ pub(crate) fn find_email_autolink(
         return None; // empty username
     }
 
-    let delims = Delims::Paired(resolved);
+    let delims = DelimiterBoundary::IfPaired(resolved);
     if !check_left_boundary(content, beg, delims) {
         return None;
     }
@@ -591,7 +591,7 @@ pub(crate) fn find_www_autolink(
     }
 
     let beg = pos - 3;
-    if !check_left_boundary(content, beg, Delims::Bytes) {
+    if !check_left_boundary(content, beg, DelimiterBoundary::Always) {
         return None;
     }
     let end = scan_url_tail(content, beg, pos + 1, 1, ctx)?;
@@ -633,7 +633,7 @@ fn scan_url_tail(
         }
         None => {
             let end = post_process_autolink_end(content, beg, path.end, frag.end, ctx);
-            check_right_boundary(content, end, Delims::None).then_some(end)
+            check_right_boundary(content, end, DelimiterBoundary::Never).then_some(end)
         }
     };
     if end.is_none() {
