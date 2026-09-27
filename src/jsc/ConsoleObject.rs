@@ -1539,10 +1539,22 @@ pub mod formatter {
     /// RAII: `map.remove(value)` on drop iff `*armed`. Holds
     /// raw pointers so the body can freely take `&mut self`; smaller than the
     /// equivalent `scopeguard::defer!` closure under ASAN stack redzones.
-    pub(super) struct VisitedRemove {
+    pub(crate) struct VisitedRemove {
         map: *mut visited::Map,
         armed: *const bool,
         value: JSValue,
+    }
+    impl VisitedRemove {
+        /// # Safety
+        /// `map` and `armed` must stay valid until the guard is dropped.
+        #[inline]
+        pub(crate) unsafe fn new(
+            map: *mut visited::Map,
+            armed: *const bool,
+            value: JSValue,
+        ) -> Self {
+            Self { map, armed, value }
+        }
     }
     impl Drop for VisitedRemove {
         #[inline]
@@ -1902,6 +1914,8 @@ pub mod formatter {
             )
         }
 
+        /// `Tag::Error` is absent: the error printer records the error it
+        /// renders (`VirtualMachine::print_error_instance_body`).
         pub(crate) fn can_have_circular_references(self) -> bool {
             matches!(
                 self,
@@ -1910,7 +1924,6 @@ pub mod formatter {
                     | Tag::Object
                     | Tag::Map
                     | Tag::Set
-                    | Tag::Error
                     | Tag::Class
                     | Tag::Event
             )
@@ -3230,6 +3243,12 @@ pub mod formatter {
             let _ = self.map.remove(&value);
         }
 
+        /// Whether a caller further up the stack is rendering `value`.
+        #[inline]
+        pub(crate) fn visited_contains(&self, value: JSValue) -> bool {
+            self.map_node.is_some() && self.map.contains(&value)
+        }
+
         /// Circular-reference / stack-overflow / visited-map prelude for
         /// `print_as`. Outlined, like `visited_enter`, so its locals (the pool
         /// node, the `get_or_put` result, the `[Circular]` write path) live in
@@ -3865,25 +3884,6 @@ pub mod formatter {
             writer_: &mut dyn bun_io::Write,
             value: JSValue,
         ) -> JsResult<()> {
-            // Temporarily remove from the visited map to allow
-            // printErrorlikeObject to process it. The circular reference
-            // check is already done in print_as, so we know it's safe.
-            let was_in_map = if self.map_node.is_some() {
-                self.map.remove(&value).is_some()
-            } else {
-                false
-            };
-            let map_restore_ptr: *mut visited::Map = &raw mut self.map;
-            scopeguard::defer! {
-                // SAFETY: `self.map` outlives this guard; no other borrow is
-                // live at the drop point.
-                unsafe {
-                    if was_in_map {
-                        let _ = (*map_restore_ptr).insert(value, ());
-                    }
-                }
-            }
-
             let mut adapter = DynWriteAdapter::new(&mut *writer_);
             // SAFETY: per-thread VM.
             let vm = VirtualMachine::get().as_mut();

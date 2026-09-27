@@ -6667,6 +6667,20 @@ impl VirtualMachine {
             return Ok(());
         }
 
+        // Every render of an error passes here: a caller further up the stack
+        // is rendering this one.
+        if error_instance.is_cell()
+            && error_instance.js_type() == crate::JSType::ErrorInstance
+            && formatter.visited_contains(error_instance)
+        {
+            writer.write_all(if allow_ansi_color {
+                bun_core::pretty_fmt!("<r><cyan>[Circular]<r>", true).as_bytes()
+            } else {
+                bun_core::pretty_fmt!("<r><cyan>[Circular]<r>", false).as_bytes()
+            })?;
+            return Ok(());
+        }
+
         // Note: `Holder` is ~4 KB (32 ZigStackFrames + 6 source lines +
         // ZigException). It sits next to the large runtime-dispatched body, so
         // box it to keep the per-level recursion frame small enough for the
@@ -7037,6 +7051,18 @@ impl VirtualMachine {
             NonNull::new(&raw mut errors_to_append).expect("stack addr"),
         ));
 
+        // `error_instance` is in the visited set from the first render it
+        // nests to the exit. An error that nests none is never recorded.
+        let recorded = core::cell::Cell::new(false);
+        // SAFETY: `formatter` and `recorded` outlive the guard.
+        let _visited = unsafe {
+            crate::console_object::formatter::VisitedRemove::new(
+                &raw mut formatter.map,
+                recorded.as_ptr(),
+                error_instance,
+            )
+        };
+
         if is_error_instance {
             let mut saw_cause = false;
             // SAFETY: `is_error_instance` ⇒ object.
@@ -7065,7 +7091,11 @@ impl VirtualMachine {
                 }
 
                 let kind = value.js_type();
-                if kind == JSType::ErrorInstance && !prev_had_errors {
+                // An error that is being rendered prints in place, under its
+                // key, as `[Circular]`.
+                let circular = kind == JSType::ErrorInstance
+                    && (value == error_instance || formatter.visited_contains(value));
+                if kind == JSType::ErrorInstance && !prev_had_errors && !circular {
                     if field.eq_ascii(b"cause") {
                         saw_cause = true;
                     }
@@ -7076,6 +7106,12 @@ impl VirtualMachine {
                     || value.is_primitive()
                     || kind.is_string_like()
                 {
+                    if circular && field.eq_ascii(b"cause") {
+                        saw_cause = true;
+                    }
+                    if !recorded.get() && !value.is_primitive() {
+                        recorded.set(!formatter.visited_enter(error_instance));
+                    }
                     let prev_disable_inspect_custom = formatter.disable_inspect_custom;
                     let prev_quote_strings = formatter.quote_strings;
                     let prev_max_depth = formatter.max_depth;
@@ -7200,19 +7236,18 @@ impl VirtualMachine {
             )?;
         }
 
+        if !recorded.get() && !errors_to_append.is_empty() {
+            recorded.set(!formatter.visited_enter(error_instance));
+        }
+
         let mut exception_list = exception_list;
         for &err in &errors_to_append {
-            // Circular-ref guard for cause chains.
-            if formatter.visited_enter(err) {
-                writer.write_all(b"\n")?;
-                pretty_write!(writer, "<r><cyan>[Circular]<r>")?;
-                continue;
-            }
-
             writer.write_all(b"\n")?;
             let prev_depth = formatter.depth;
             formatter.depth = formatter.depth.saturating_add(1);
-            let over_cap = formatter.depth > formatter.error_chain_max_depth();
+            // An error that is being rendered prints `[Circular]` at any depth.
+            let over_cap = formatter.depth > formatter.error_chain_max_depth()
+                && !formatter.visited_contains(err);
             let result: crate::CrateResult<()> = if over_cap {
                 pretty_write!(writer, "<r><cyan>[Error ...]<r>").map_err(Into::into)
             } else {
@@ -7226,7 +7261,6 @@ impl VirtualMachine {
                 )
             };
             formatter.depth = prev_depth;
-            formatter.visited_leave(err);
             result?;
         }
 
