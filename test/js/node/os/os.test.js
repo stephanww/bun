@@ -184,6 +184,17 @@ describe.skipIf(!isLinux)("cpus on Linux", () => {
     ]);
   });
 
+  // https://github.com/oven-sh/bun/issues/44125
+  // A proot or container bind-mounts a hand-written /proc/stat with fewer CPU lines
+  // than the live /proc/cpuinfo has processor blocks.
+  it("fills every /proc/stat CPU when /proc/cpuinfo has one processor more", () => {
+    const statIds = [0, 1, 2, 3, 4, 5, 6, 7];
+    using root = procfs(statIds, [...statIds, 8], []);
+    expect(linuxCpusFromRoot(String(root))).toEqual(
+      statIds.map(id => ({ times: times(id), model: `EPYC 7713 (cpu ${id})`, speed: 0 })),
+    );
+  });
+
   it("reports an unknown model for a CPU that /proc/cpuinfo does not list", () => {
     using root = procfs([0, 4], [4], []);
     expect(linuxCpusFromRoot(String(root))).toEqual([
