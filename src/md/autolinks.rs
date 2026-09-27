@@ -184,7 +184,7 @@ impl AutolinkScanMemo {
         self.host_cut_marks.has(start, min)
     }
 
-    /// The first `*`, `_` or `~` of the delimiters and periods that `content[from..end]` ends with, or the one at `end`.
+    /// The first delimiter of the delimiters and periods at the end of `content[from..end]` or at `end`, if the token has only punctuation from there on.
     fn delimiter_in_tail(
         &mut self,
         content: &[u8],
@@ -205,6 +205,9 @@ impl AutolinkScanMemo {
                 if content[pos] != b'.' {
                     run = base + pos;
                 }
+            }
+            if run != NONE && !token_ends_with_punctuation(content, end) {
+                run = NONE;
             }
             if !self.armed || pos == from {
                 return (run != NONE).then(|| run - base);
@@ -390,8 +393,10 @@ const RIGHT_BOUNDARY: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C)}]<.!?,;&");
 /// Which emphasis delimiters (*_~) next to a link are a boundary.
 #[derive(Copy, Clone)]
 enum Delims<'a> {
-    /// Each of them (url, www): the link is found before emphasis is paired.
+    /// Each of them, in front of a URL or WWW link: the link is found before emphasis is paired.
     Bytes,
+    /// None of them, behind a URL or WWW link: `delimiter_in_tail` finds the run that ends a link.
+    None,
     /// One whose run was paired (email).
     Paired(&'a [EmphDelim]),
 }
@@ -400,9 +405,22 @@ impl Delims<'_> {
     fn is_boundary(self, at: usize) -> bool {
         match self {
             Delims::Bytes => true,
+            Delims::None => false,
             Delims::Paired(resolved) => is_paired_delimiter(resolved, at),
         }
     }
+}
+
+const TRAILING_PUNCTUATION: ByteSet = ByteSet::of(b"*_~.,:;!?'\")]}");
+const TOKEN_END: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C<");
+
+/// True if the token has only punctuation from `pos` on. A token ends at whitespace, at '<' and at a byte that is not ASCII.
+fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
+    let mut pos = pos;
+    while pos < content.len() && TRAILING_PUNCTUATION.contains(content[pos]) {
+        pos += 1;
+    }
+    pos >= content.len() || TOKEN_END.contains(content[pos]) || !content[pos].is_ascii()
 }
 
 /// Check left boundary for permissive autolinks.
@@ -582,11 +600,9 @@ fn scan_url_tail(
     let query = scan_url_component(content, Some(ctx), QUERY, path.end, 1);
     let frag = scan_url_component(content, Some(ctx), FRAGMENT, query.end, 1);
 
-    // The bytes from the run on are not in the link, so the byte behind them must be a boundary.
     let run = ctx
         .memo
-        .delimiter_in_tail(content, ctx.base, host_start, frag.end)
-        .filter(|_| check_right_boundary(content, frag.end, Delims::Bytes));
+        .delimiter_in_tail(content, ctx.base, host_start, frag.end);
     let end = match run {
         Some(run) => {
             let host = HostScan {
@@ -594,11 +610,11 @@ fn scan_url_tail(
                 accept_end: host.accept_end,
                 min_components: min_host_components,
             };
-            end_at_delimiter_run(content, beg, host, path.end, run, ctx)
+            end_at_delimiter_run(content, host, path.end, run, ctx)
         }
         None => {
             let end = post_process_autolink_end(content, beg, path.end, frag.end, ctx);
-            check_right_boundary(content, end, Delims::Bytes).then_some(end)
+            check_right_boundary(content, end, Delims::None).then_some(end)
         }
     };
     if end.is_none() {
@@ -614,25 +630,27 @@ struct HostScan {
     min_components: u32,
 }
 
-/// End of a link whose scan ends in the delimiter run at `run`: the link of an input that ends at `run`.
+/// End of a link whose scan ends in the delimiter run at `run`: as in GFM, without the periods and the unbalanced ')' in front of the run.
 fn end_at_delimiter_run(
     content: &[u8],
-    beg: usize,
     host: HostScan,
     query_start: usize,
     run: usize,
     ctx: &mut ScanContext,
 ) -> Option<usize> {
-    if run <= host.start {
-        return None;
+    let mut end = run;
+    let mut parens = ParenCount { open: 0, close: 0 };
+    if end > query_start {
+        parens = ctx.memo.parens(content, ctx.base, query_start, end);
     }
-    // With no byte behind it, the last byte is accepted if it is an alphanumeric, a ')' or the '/' at the end of a path.
-    let last = content[run - 1];
-    let mut end = if helpers::is_alpha_num(last) || last == b')' || last == b'/' {
-        run
-    } else {
-        run - 1
-    };
+    while end > host.start {
+        match content[end - 1] {
+            b'.' => {}
+            b')' if parens.close > parens.open => parens.close -= 1,
+            _ => break,
+        }
+        end -= 1;
+    }
     if end < host.accept_end {
         let (base, memo, min) = (ctx.base, &mut *ctx.memo, host.min_components);
         let ok = if memo.armed && memo.covers(HOST, base + host.start) {
@@ -643,14 +661,8 @@ fn end_at_delimiter_run(
         if !ok {
             return None;
         }
-    } else if end > query_start {
-        let ParenCount { open, mut close } = ctx.memo.parens(content, ctx.base, query_start, end);
-        while end > beg && content[end - 1] == b')' && close > open {
-            end -= 1;
-            close -= 1;
-        }
     }
-    (end == run || RIGHT_BOUNDARY.contains(content[end])).then_some(end)
+    Some(end)
 }
 
 /// GFM post-processing: trim trailing unbalanced `)` and entity-like suffixes from autolink URLs.
