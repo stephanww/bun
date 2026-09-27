@@ -92,7 +92,8 @@ pub struct AutolinkScanMemo {
     /// Marks of the host run up to `host_cut`.
     host_cut_marks: HostMarks,
     host_cut: usize,
-    /// The delimiters and periods in front of `tail_end` start at `tail_start`, `tail_run` is the first delimiter.
+    /// Of a slice that ends at `tail_limit`: the delimiters and periods in front of `tail_end` start at `tail_start`, `tail_run` is what `delimiter_in_tail` returns.
+    tail_limit: usize,
     tail_end: usize,
     tail_start: usize,
     tail_run: usize,
@@ -110,6 +111,7 @@ impl AutolinkScanMemo {
         host_marks: HostMarks::EMPTY,
         host_cut_marks: HostMarks::EMPTY,
         host_cut: NONE,
+        tail_limit: NONE,
         tail_end: NONE,
         tail_start: NONE,
         tail_run: NONE,
@@ -192,7 +194,11 @@ impl AutolinkScanMemo {
         from: usize,
         end: usize,
     ) -> Option<usize> {
-        let known = self.armed && self.tail_end == base + end && self.tail_start >= base + from;
+        let limit = base + content.len();
+        let known = self.armed
+            && self.tail_end == base + end
+            && self.tail_limit == limit
+            && self.tail_start >= base + from;
         if !known {
             let mut run = NONE;
             if end < content.len() && EMPH_DELIMS.contains(content[end]) {
@@ -212,6 +218,7 @@ impl AutolinkScanMemo {
             if !self.armed || pos == from {
                 return (run != NONE).then(|| run - base);
             }
+            self.tail_limit = limit;
             self.tail_end = base + end;
             self.tail_start = base + pos;
             self.tail_run = run;
@@ -414,11 +421,20 @@ impl Delims<'_> {
 const TRAILING_PUNCTUATION: ByteSet = ByteSet::of(b"*_~.,:;!?'\")]}");
 const TOKEN_END: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C<");
 
-/// True if the token has only punctuation from `pos` on. A token ends at whitespace, at '<' and at a byte that is not ASCII.
+/// True if the token has only punctuation and entities from `pos` on. A token ends at whitespace, at '<' and at a byte that is not ASCII.
 fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
     let mut pos = pos;
-    while pos < content.len() && TRAILING_PUNCTUATION.contains(content[pos]) {
-        pos += 1;
+    while pos < content.len() {
+        let entity = if content[pos] == b'&' {
+            helpers::find_entity(content, pos)
+        } else {
+            None
+        };
+        match entity {
+            Some(end) => pos = end,
+            None if TRAILING_PUNCTUATION.contains(content[pos]) => pos += 1,
+            None => break,
+        }
     }
     pos >= content.len() || TOKEN_END.contains(content[pos]) || !content[pos].is_ascii()
 }
