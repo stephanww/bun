@@ -1829,9 +1829,8 @@ pub mod formatter {
         /// so every node returned by [`Pool::get_node`] carries an initialized
         /// `data` payload, and the caller exclusively owns the node until
         /// [`Pool::release`]. Centralises the `NonNull::as_mut()` +
-        /// `assume_init_mut()` pair so the four call sites in this file (and
-        /// the cause-chain guard in `VirtualMachine::print_error_instance`)
-        /// don't each open-code two `unsafe` operations.
+        /// `assume_init_mut()` pair so its call sites don't each open-code two
+        /// `unsafe` operations.
         #[inline]
         pub(crate) fn node_data_mut(node: &mut core::ptr::NonNull<PoolNode>) -> &mut Map {
             // SAFETY: `Map::INIT` is `Some`, so `data` is initialized for
@@ -3210,10 +3209,31 @@ pub mod formatter {
     // ───────────────────────────────────────────────────────────────────────
 
     impl<'a> Formatter<'a> {
+        /// Records `value` as being rendered and returns whether it already
+        /// was. The pooled map is taken on the first call.
+        #[inline(never)]
+        pub(crate) fn visited_enter(&mut self, value: JSValue) -> bool {
+            if self.map_node.is_none() {
+                let mut node = core::ptr::NonNull::new(visited::Pool::get_node())
+                    .expect("ObjectPool::get_node always returns a valid heap node");
+                let data = visited::node_data_mut(&mut node);
+                data.clear();
+                self.map = core::mem::take(data);
+                self.map_node = Some(node);
+            }
+            self.map.get_or_put(value).expect("unreachable").found_existing
+        }
+
+        /// Ends the record that `visited_enter` made for `value`.
+        #[inline]
+        pub(crate) fn visited_leave(&mut self, value: JSValue) {
+            let _ = self.map.remove(&value);
+        }
+
         /// Circular-reference / stack-overflow / visited-map prelude for
-        /// `print_as`. Outlined so its locals (the pool node, the
-        /// `get_or_put` result, the `[Circular]` write path) live in a leaf
-        /// frame that is popped before the recursive descent into
+        /// `print_as`. Outlined, like `visited_enter`, so its locals (the pool
+        /// node, the `get_or_put` result, the `[Circular]` write path) live in
+        /// leaf frames that are popped before the recursive descent into
         /// `print_object`/`print_array` — under ASAN debug those locals each
         /// carry a 32-byte redzone, and the 512-deep `Bun.inspect` test
         /// cannot afford them in the per-level `print_as` frame.
@@ -3245,17 +3265,7 @@ pub mod formatter {
                 return Ok(false);
             }
 
-            if self.map_node.is_none() {
-                let mut node = core::ptr::NonNull::new(visited::Pool::get_node())
-                    .expect("ObjectPool::get_node always returns a valid heap node");
-                let data = visited::node_data_mut(&mut node);
-                data.clear();
-                self.map = core::mem::take(data);
-                self.map_node = Some(node);
-            }
-
-            let entry = self.map.get_or_put(value).expect("unreachable");
-            if entry.found_existing {
+            if self.visited_enter(value) {
                 if writer_
                     .write_all(pfmt!("<r><cyan>[Circular]<r>", C).as_bytes())
                     .is_err()
@@ -4554,7 +4564,7 @@ pub mod formatter {
             } else if js_type != jsc::JSType::DOMWrapper {
                 if *remove_before_recurse {
                     *remove_before_recurse = false;
-                    let _ = self.map.remove(&value);
+                    self.visited_leave(value);
                 }
 
                 if value.is_callable() {
@@ -4567,7 +4577,7 @@ pub mod formatter {
             }
             if *remove_before_recurse {
                 *remove_before_recurse = false;
-                let _ = self.map.remove(&value);
+                self.visited_leave(value);
             }
 
             *remove_before_recurse = true;
@@ -4837,7 +4847,7 @@ pub mod formatter {
                 evt @ (EventType::MessageEvent | EventType::ErrorEvent) => evt,
                 _ => {
                     if *remove_before_recurse {
-                        let _ = self.map.remove(&value);
+                        self.visited_leave(value);
                     }
                     // We must potentially remove it again.
                     *remove_before_recurse = true;
