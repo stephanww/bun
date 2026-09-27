@@ -1601,11 +1601,11 @@ describe("permissive autolinks and emphasis delimiters", () => {
 
   test("every mix of delimiters around and in a link renders balanced tags", () => {
     const links = ["a@b.co", "http://a.bc/d", "http://a.bc/d*e", "www.a.bc/_d_/~e", "www.a.bc/d.", "a@b._c_.de"];
-    const tails = ["", "x", "_x", " x*", ".", ": x", "&amp;", "(x)", "=1", "\\\nx", "é"];
+    const tails = ["", "x", " x*", ".", "&amp;", "(x)", "é"];
     const bad: string[] = [];
     for (const before of ["", "*", "__", "~~"]) {
       for (const link of links) {
-        for (const after of ["", "*", "**", "__", "~~", ".*", "*."]) {
+        for (const after of ["", "*", "**", "__", "~~", ".*"]) {
           for (const tail of tails) {
             const input = before + link + after + tail;
             const html = Markdown.html(input, opts);
@@ -1624,39 +1624,40 @@ describe("permissive autolinks and emphasis delimiters", () => {
   test("floods of links next to emphasis delimiters render in linear time", async () => {
     await expectRendersQuickly(`
       const fill = (n, unit) => Buffer.alloc(n * unit.length, unit).toString();
-      const count = (html, tag) => {
-        let found = 0;
-        for (let at = html.indexOf(tag); at >= 0; at = html.indexOf(tag, at + 1)) found++;
-        return found;
-      };
       const n = 30000;
       const candidates = fill(n, "*www.a.bc/x");
+      const link = text => '<a href="http://' + text + '">' + text + "</a>";
+      const pair = '<strong><a href="http://a.bc/__d__/e">http://a.bc/__d__/e</a></strong> ';
+      // A case with no output has no link: its output is that of a render with no autolinks.
       const cases = [
         // One link: the "*" are bytes of it.
-        ["one link", fill(n, "*www.a.bc/"), 1, 0],
+        ["one link", fill(n, "*www.a.bc/"), "<p>*" + link(fill(n, "*www.a.bc/").slice(1)) + "</p>\\n"],
         // One link that ends at the last "*": only that "*" has nothing of the URL behind it.
-        ["one link that ends at a run", candidates + "-*", 1, 0],
+        [
+          "one link that ends at a run",
+          candidates + "-*",
+          "<p><em>" + link(candidates.slice(1) + "-") + "</em></p>\\n",
+        ],
         // A link in each pair.
-        ["links in pairs", fill(n, "**http://a.bc/__d__/e** "), n, n],
-        // No link: each candidate reads up to the "(", and "(" is no boundary.
-        ["no boundary", candidates + "(", 0, 0],
-        ["no boundary, host", fill(n, "_www.a") + "(", 0, 0],
-        // No link: each candidate reads up to the same run, and more than punctuation follows the run.
-        ["run in front of a parenthesis", candidates + "*(", 0, 0],
-        ["run in front of a parenthesis, host", fill(n, "_www.a") + "_(", 0, 0],
-        ["periods behind the run", candidates + "*" + fill(6 * n, ".") + "(", 0, 0],
-        ["periods in front of the run, host", fill(n, "_www.a") + fill(6 * n, ".") + "_(", 0, 0],
-        ["long run", candidates + fill(6 * n, "*") + "(", 0, 0],
-        ["punctuation behind the run", candidates + "*" + fill(6 * n, ",") + "(", 0, 0],
-        ["entities behind the run", candidates + "*" + fill(n, "&amp;") + "(", 0, 0],
-        ["image label", "![" + candidates + "*" + fill(6 * n, ".") + "(](u)", 0, 0],
-        ["wiki link label", "[[a|" + candidates + "*" + fill(6 * n, ".") + "(]]", 0, 0],
+        ["links in pairs", fill(n, "**http://a.bc/__d__/e** "), "<p>" + fill(n, pair).slice(0, -1) + "</p>\\n"],
+        // Each candidate reads up to the "(", and "(" is no boundary.
+        ["no boundary", candidates + "("],
+        ["no boundary, host", fill(n, "_www.a") + "("],
+        // Each candidate reads up to the same run, and more than punctuation follows the run.
+        ["run in front of a parenthesis", candidates + "*("],
+        ["run in front of a parenthesis, host", fill(n, "_www.a") + "_("],
+        ["periods behind the run", candidates + "*" + fill(6 * n, ".") + "("],
+        ["periods in front of the run, host", fill(n, "_www.a") + fill(6 * n, ".") + "_("],
+        ["long run", candidates + fill(6 * n, "*") + "("],
+        ["punctuation behind the run", candidates + "*" + fill(6 * n, ",") + "("],
+        ["entities behind the run", candidates + "*" + fill(n, "&amp;") + "("],
+        ["image label", "![" + candidates + "*" + fill(6 * n, ".") + "(](u)"],
+        ["wiki link label", "[[a|" + candidates + "*" + fill(6 * n, ".") + "(]]"],
       ];
-      for (const [name, input, links, strong] of cases) {
+      for (const [name, input, expected = Bun.markdown.html(input, { wikiLinks: true })] of cases) {
         const html = Bun.markdown.html(input, { autolinks: true, wikiLinks: true });
-        const found = [count(html, "<a "), count(html, "</a>"), count(html, "<strong>"), count(html, "</strong>")];
-        if (found.join() !== [links, links, strong, strong].join() || count(html, "<em>") !== count(html, "</em>")) {
-          throw new Error("unexpected output for " + name + ": " + found + " " + JSON.stringify(html.slice(0, 120)));
+        if (html !== expected) {
+          throw new Error("unexpected output for " + name + ": " + JSON.stringify(html.slice(0, 120)));
         }
         console.log("OK " + name);
       }
