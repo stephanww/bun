@@ -20,6 +20,8 @@ pub(crate) struct LabelFrame {
     text_start: usize,
     resolved: Vec<EmphDelim>,
     delim_cursor: usize,
+    autolink_base: usize,
+    autolink_cursor: usize,
     leave: LabelLeave,
 }
 
@@ -214,6 +216,9 @@ impl Parser<'_> {
         let mut base: usize = 0;
 
         // Phase 1: Collect and resolve emphasis delimiters
+        self.autolinks.clear();
+        self.autolink_base = 0;
+        self.autolink_cursor = 0;
         self.collect_emphasis_delimiters(cur, &brackets, base);
         self.resolve_emphasis_delimiters();
 
@@ -237,10 +242,14 @@ impl Parser<'_> {
                     text_start: parse.link_end,
                     resolved: core::mem::take(&mut resolved),
                     delim_cursor,
+                    autolink_base: self.autolink_base,
+                    autolink_cursor: self.autolink_cursor,
                     leave: parse.leave,
                 });
                 base += parse.label_start;
                 cur = &cur[parse.label_start..parse.label_end];
+                self.autolink_base = self.autolinks.len();
+                self.autolink_cursor = self.autolink_base;
                 self.collect_emphasis_delimiters(cur, &brackets, base);
                 self.resolve_emphasis_delimiters();
                 resolved = self.emph_delims.clone();
@@ -480,7 +489,7 @@ impl Parser<'_> {
                         || (c == b'@' && self.flags.permissive_email_autolinks)
                         || (c == b'.' && self.flags.permissive_www_autolinks))
                 {
-                    if let Some(a) = self.permissive_autolink_at(content, i, &resolved, base) {
+                    if let Some(a) = self.permissive_autolink_at(content, i, &resolved) {
                         if a.beg > text_start {
                             self.emit_text(TextType::Normal, &content[text_start..a.beg])?;
                         }
@@ -571,6 +580,9 @@ impl Parser<'_> {
                     text_start = frame.text_start;
                     resolved = frame.resolved;
                     delim_cursor = frame.delim_cursor;
+                    self.autolinks.truncate(self.autolink_base);
+                    self.autolink_base = frame.autolink_base;
+                    self.autolink_cursor = frame.autolink_cursor;
                 }
                 None => break 'frames,
             }
@@ -591,17 +603,22 @@ impl Parser<'_> {
         content: &[u8],
         pos: usize,
         resolved: &[EmphDelim],
-        base: usize,
     ) -> Option<Autolink> {
-        let mut ctx = ScanContext {
-            memo: &mut self.autolink_scan_memo,
-            base,
-        };
-        match content[pos] {
-            b':' => find_url_autolink(content, pos, resolved, &mut ctx),
-            b'@' => find_email_autolink(content, pos, resolved),
-            _ => find_www_autolink(content, pos, resolved, &mut ctx),
+        if content[pos] == b'@' {
+            return find_email_autolink(content, pos, resolved);
         }
+        // collect_emphasis_delimiters found the URL and WWW links of this slice.
+        while self
+            .autolinks
+            .get(self.autolink_cursor)
+            .is_some_and(|l| l.trigger < pos)
+        {
+            self.autolink_cursor += 1;
+        }
+        self.autolinks
+            .get(self.autolink_cursor)
+            .filter(|l| l.trigger == pos)
+            .copied()
     }
 
     pub(crate) fn enter_span(&mut self, span_type: SpanType) -> crate::types::JsResult<()> {
@@ -693,6 +710,7 @@ impl Parser<'_> {
     /// Collect emphasis delimiter runs from content, skipping code spans and
     /// HTML tags. `base` is the offset of `content` within the slice
     /// `brackets` was built for.
+    /// Bare URL and WWW links are found here too, and their bytes are skipped.
     pub(crate) fn collect_emphasis_delimiters(
         &mut self,
         content: &[u8],
@@ -799,6 +817,25 @@ impl Parser<'_> {
                     });
                 }
                 continue;
+            }
+            if ((c == b':' && self.flags.permissive_url_autolinks)
+                || (c == b'.' && self.flags.permissive_www_autolinks))
+                && self.link_nesting_level == 0
+            {
+                let mut ctx = ScanContext {
+                    memo: &mut self.autolink_scan_memo,
+                    base,
+                };
+                let al = if c == b':' {
+                    find_url_autolink(content, i, &mut ctx)
+                } else {
+                    find_www_autolink(content, i, &mut ctx)
+                };
+                if let Some(al) = al {
+                    self.autolinks.push(al);
+                    i = al.end;
+                    continue;
+                }
             }
             i += 1;
         }
