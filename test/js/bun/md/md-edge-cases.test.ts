@@ -1380,8 +1380,10 @@ describe("pathological autolink inputs", () => {
 
 // ============================================================================
 // Bare URL and www links are found before emphasis is paired, so a "*", "_" or
-// "~" in a link is a byte of the URL and never half of a pair. An email link
-// is found after emphasis is paired and ends in front of a paired delimiter.
+// "~" in a link is a byte of the URL and never half of a pair. Such a link
+// ends at a run of delimiters only if the rest of the word is punctuation: a
+// link to a part of a URL goes to another page. An email link is found after
+// emphasis is paired and ends in front of a paired delimiter.
 // ============================================================================
 
 describe("permissive autolinks and emphasis delimiters", () => {
@@ -1391,6 +1393,7 @@ describe("permissive autolinks and emphasis delimiters", () => {
   function isWellFormed(html: string): boolean {
     const open: string[] = [];
     for (const [, slash, name] of html.matchAll(/<(\/?)([a-z]+)[^>]*>/g)) {
+      if (name === "br") continue;
       if (!slash) open.push(name);
       else if (open.pop() !== name) return false;
     }
@@ -1420,6 +1423,30 @@ describe("permissive autolinks and emphasis delimiters", () => {
     ["~~www.example.com/a~~", '<p><del><a href="http://www.example.com/a">www.example.com/a</a></del></p>\n'],
     ["_http://foo.bar._", '<p><em><a href="http://foo.bar">http://foo.bar</a>.</em></p>\n'],
     ["**www.a.bc/?q=b)**", '<p><strong><a href="http://www.a.bc/?q=b">www.a.bc/?q=b</a>)</strong></p>\n'],
+    [
+      "**https://example.com/path**: text",
+      '<p><strong><a href="https://example.com/path">https://example.com/path</a></strong>: text</p>\n',
+    ],
+    [
+      "(**https://example.com/path**)",
+      '<p>(<strong><a href="https://example.com/path">https://example.com/path</a></strong>)</p>\n',
+    ],
+    [
+      "**https://example.com/path**&amp;",
+      '<p><strong><a href="https://example.com/path">https://example.com/path</a></strong>&amp;</p>\n',
+    ],
+    [
+      "**See http://example.com/page-**",
+      '<p><strong>See <a href="http://example.com/page-">http://example.com/page-</a></strong></p>\n',
+    ],
+    [
+      "**https://example.com/a+**",
+      '<p><strong><a href="https://example.com/a+">https://example.com/a+</a></strong></p>\n',
+    ],
+    [
+      "https://example.com/my_dir_/",
+      '<p><a href="https://example.com/my_dir_/">https://example.com/my_dir_/</a></p>\n',
+    ],
     ["__a@b.cob__", '<p><strong><a href="mailto:a@b.cob">a@b.cob</a></strong></p>\n'],
     ["_a@b.co__", '<p><em><a href="mailto:a@b.co">a@b.co</a></em>_</p>\n'],
     ["__mail a@b.co.__", '<p><strong>mail <a href="mailto:a@b.co">a@b.co</a>.</strong></p>\n'],
@@ -1427,18 +1454,20 @@ describe("permissive autolinks and emphasis delimiters", () => {
     ["_x a@b.c_.d", '<p><em>x <a href="mailto:a@b.c">a@b.c</a></em>.d</p>\n'],
     [
       "**Note:** contact __support@example.com__ today.\n\nSecond paragraph.",
-      '<p><strong>Note:</strong> contact <strong><a href="mailto:support@example.com">support@example.com</a></strong> today.</p>\n' +
-        "<p>Second paragraph.</p>\n",
+      '<p><strong>Note:</strong> contact <strong><a href="mailto:support@example.com">support@example.com</a></strong> today.</p>\n<p>Second paragraph.</p>\n',
     ],
     [
       "http://a.bc/x ![a www.d.ef/y](i) www.g.hi/z ![b](j) k@l.mn",
-      '<p><a href="http://a.bc/x">http://a.bc/x</a> <img src="i" alt="a www.d.ef/y" /> ' +
-        '<a href="http://www.g.hi/z">www.g.hi/z</a> <img src="j" alt="b" /> <a href="mailto:k@l.mn">k@l.mn</a></p>\n',
+      '<p><a href="http://a.bc/x">http://a.bc/x</a> <img src="i" alt="a www.d.ef/y" /> <a href="http://www.g.hi/z">www.g.hi/z</a> <img src="j" alt="b" /> <a href="mailto:k@l.mn">k@l.mn</a></p>\n',
     ],
     // As cmark-gfm: the delimiters in and next to a URL or www link are bytes. md4c pairs them first.
     [
       "**See http://example.com/page.**",
       '<p><strong>See <a href="http://example.com/page">http://example.com/page</a>.</strong></p>\n',
+    ],
+    [
+      "**See http://example.com/page...**",
+      '<p><strong>See <a href="http://example.com/page">http://example.com/page</a>...</strong></p>\n',
     ],
     ["*see www.example.com/a.*", '<p><em>see <a href="http://www.example.com/a">www.example.com/a</a>.</em></p>\n'],
     [
@@ -1461,6 +1490,10 @@ describe("permissive autolinks and emphasis delimiters", () => {
       "http://example.com/path*with stars*",
       '<p><a href="http://example.com/path*with">http://example.com/path*with</a> stars*</p>\n',
     ],
+    [
+      "**https://example.com/path**more",
+      '<p>**<a href="https://example.com/path**more">https://example.com/path**more</a></p>\n',
+    ],
     ["*a http://x.yz/b*c d*", '<p><em>a <a href="http://x.yz/b*c">http://x.yz/b*c</a> d</em></p>\n'],
     ["2*3 http://x.yz/a*b", '<p>2*3 <a href="http://x.yz/a*b">http://x.yz/a*b</a></p>\n'],
     ["*a*http://a.bc/*y z*", '<p><em>a</em><a href="http://a.bc/*y">http://a.bc/*y</a> z*</p>\n'],
@@ -1469,20 +1502,37 @@ describe("permissive autolinks and emphasis delimiters", () => {
       "http://foo._tcp.example.com/x_",
       '<p><a href="http://foo._tcp.example.com/x">http://foo._tcp.example.com/x</a>_</p>\n',
     ],
+    ["*https://example.com/x", '<p>*<a href="https://example.com/x">https://example.com/x</a></p>\n'],
     ["*www.a.bc/x", '<p>*<a href="http://www.a.bc/x">www.a.bc/x</a></p>\n'],
     ["foo_www.a.bc", '<p>foo_<a href="http://www.a.bc">www.a.bc</a></p>\n'],
-    // As md4c. cmark-gfm prints no link: it allows no "_" in the last two parts of a domain.
+    // As md4c. cmark-gfm allows no "_" in the last two parts of a domain, and it reads a link up to the next
+    // whitespace, through a backslash and through text that is not ASCII.
     ["__www.a.bc__", '<p><strong><a href="http://www.a.bc">www.a.bc</a></strong></p>\n'],
+    [
+      "**https://example.com/path**を参照",
+      '<p><strong><a href="https://example.com/path">https://example.com/path</a></strong>を参照</p>\n',
+    ],
+    [
+      "**https://example.com/path**\\\nnext",
+      '<p><strong><a href="https://example.com/path">https://example.com/path</a></strong><br />\nnext</p>\n',
+    ],
     // As md4c (spec-permissive-autolinks.txt): a delimiter next to an email address is a boundary if it is paired.
     ["*john.doe@example.com", "<p>*john.doe@example.com</p>\n"],
     ["john.doe@example.com*", "<p>john.doe@example.com*</p>\n"],
-    // Bun only. The input of the link ends at the delimiter run, and the rules for the end of a link in
-    // plain text apply: "See http://example.com/page- Next" has no link, "page... Next" links "page..".
-    ["**See http://example.com/page-**", "<p><strong>See http://example.com/page-</strong></p>\n"],
+    // No link, as before and as md4c: more of the URL follows the delimiter, and the link would go to another page.
+    // cmark-gfm links the whole URL.
     [
-      "**See http://example.com/page...**",
-      '<p><strong>See <a href="http://example.com/page..">http://example.com/page..</a>.</strong></p>\n',
+      "https://en.wikipedia.org/wiki/Python_(programming_language)",
+      "<p>https://en.wikipedia.org/wiki/Python_(programming_language)</p>\n",
     ],
+    ["https://example.com/a_=b", "<p>https://example.com/a_=b</p>\n"],
+    ["https://example.com/a*(b)", "<p>https://example.com/a*(b)</p>\n"],
+    ["https://ja.wikipedia.org/wiki/Google_マップ", "<p>https://ja.wikipedia.org/wiki/Google_マップ</p>\n"],
+    // Bun only, no link: text that is not punctuation follows the delimiters. md4c ends the link at the paired
+    // delimiters. cmark-gfm links all of it, with the delimiters.
+    ["_see http://a.bc/x_=b", "<p><em>see http://a.bc/x</em>=b</p>\n"],
+    ["**https://bun.sh**'s docs", "<p><strong>https://bun.sh</strong>'s docs</p>\n"],
+    ["**https://example.com/path**[1]", "<p><strong>https://example.com/path</strong>[1]</p>\n"],
   ])("html(%j)", (input, expected) => {
     expect(Markdown.html(input, opts)).toBe(expected);
   });
@@ -1551,15 +1601,18 @@ describe("permissive autolinks and emphasis delimiters", () => {
 
   test("every mix of delimiters around and in a link renders balanced tags", () => {
     const links = ["a@b.co", "http://a.bc/d", "http://a.bc/d*e", "www.a.bc/_d_/~e", "www.a.bc/d.", "a@b._c_.de"];
-    const tails = ["", "x", "_x", " x*"];
+    const tails = ["", "x", "_x", " x*", ".", ": x", "&amp;", "(x)", "=1", "\\\nx", "é"];
     const bad: string[] = [];
     for (const before of ["", "*", "__", "~~"]) {
       for (const link of links) {
-        for (const after of ["", "*", "**", "__", "~~"]) {
+        for (const after of ["", "*", "**", "__", "~~", ".*", "*."]) {
           for (const tail of tails) {
             const input = before + link + after + tail;
             const html = Markdown.html(input, opts);
-            const text = html.replace(/<[^>]*>/g, "").replace(/\n$/, "");
+            const text = html
+              .replace(/<[^>]*>/g, "")
+              .replace(/\n$/, "")
+              .replaceAll("&amp;", "&");
             if (!isWellFormed(html) || Markdown.render(input, {}, opts) !== text) bad.push(input);
           }
         }
@@ -1571,22 +1624,36 @@ describe("permissive autolinks and emphasis delimiters", () => {
   test("floods of links next to emphasis delimiters render in linear time", async () => {
     await expectRendersQuickly(`
       const fill = (n, unit) => Buffer.alloc(n * unit.length, unit).toString();
-      const count = (html, tag) => html.split(tag).length - 1;
+      const count = (html, tag) => {
+        let found = 0;
+        for (let at = html.indexOf(tag); at >= 0; at = html.indexOf(tag, at + 1)) found++;
+        return found;
+      };
       const n = 30000;
+      const candidates = fill(n, "*www.a.bc/x");
       const cases = [
-        // One link: the "*" are bytes of it, up to the run that ends it.
+        // One link: the "*" are bytes of it.
         ["one link", fill(n, "*www.a.bc/"), 1, 0],
+        // One link that ends at the last "*": only that "*" has nothing of the URL behind it.
+        ["one link that ends at a run", candidates + "-*", 1, 0],
         // A link in each pair.
         ["links in pairs", fill(n, "**http://a.bc/__d__/e** "), n, n],
         // No link: each candidate reads up to the "(", and "(" is no boundary.
-        ["no boundary", fill(n, "*www.a.bc/x") + "(", 0, 0],
+        ["no boundary", candidates + "(", 0, 0],
         ["no boundary, host", fill(n, "_www.a") + "(", 0, 0],
-        // No link: each candidate ends at the last run, and the "-" in front of that run is no boundary.
-        ["no boundary in front of a run", fill(n, "*www.a.bc/x") + "-*", 0, 0],
-        ["no boundary in front of a run, host", fill(n, "_www.a") + "-_", 0, 0],
+        // No link: each candidate reads up to the same run, and more than punctuation follows the run.
+        ["run in front of a parenthesis", candidates + "*(", 0, 0],
+        ["run in front of a parenthesis, host", fill(n, "_www.a") + "_(", 0, 0],
+        ["periods behind the run", candidates + "*" + fill(6 * n, ".") + "(", 0, 0],
+        ["periods in front of the run, host", fill(n, "_www.a") + fill(6 * n, ".") + "_(", 0, 0],
+        ["long run", candidates + fill(6 * n, "*") + "(", 0, 0],
+        ["punctuation behind the run", candidates + "*" + fill(6 * n, ",") + "(", 0, 0],
+        ["entities behind the run", candidates + "*" + fill(n, "&amp;") + "(", 0, 0],
+        ["image label", "![" + candidates + "*" + fill(6 * n, ".") + "(](u)", 0, 0],
+        ["wiki link label", "[[a|" + candidates + "*" + fill(6 * n, ".") + "(]]", 0, 0],
       ];
       for (const [name, input, links, strong] of cases) {
-        const html = Bun.markdown.html(input, { autolinks: true });
+        const html = Bun.markdown.html(input, { autolinks: true, wikiLinks: true });
         const found = [count(html, "<a "), count(html, "</a>"), count(html, "<strong>"), count(html, "</strong>")];
         if (found.join() !== [links, links, strong, strong].join() || count(html, "<em>") !== count(html, "</em>")) {
           throw new Error("unexpected output for " + name + ": " + found + " " + JSON.stringify(html.slice(0, 120)));
