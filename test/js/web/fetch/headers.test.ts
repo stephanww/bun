@@ -499,19 +499,25 @@ describe("Headers", () => {
         expect(estimateShallowMemoryUsageOf(inTurn)).toBe(estimateShallowMemoryUsageOf(oneByOne));
       });
 
-      // For 8,000 appends of 4 KB the quadratic join copies 131 GB, so it cannot
-      // finish before the test times out: it needs 13 s or more on a release
-      // build. The linear join copies about 130 MB in 15 ms. A debug build pays
-      // 60 microseconds a call before it copies a byte, so it does half the
-      // appends: 0.3 s, against 33 GB for the quadratic join.
-      test("a long run of appends to one name finishes", () => {
+      // For 8,000 appends of 4 KB the quadratic join copies 131 GB, which takes
+      // 17 s or more on a release build. The linear join copies about 130 MB in
+      // 15 ms. The limit is 300 times the one and a third of the other, so load
+      // on the machine does not move a result across it. The limit is in the
+      // test because CI runs with a timeout of 90 s. A debug build pays 60
+      // microseconds a call before it copies a byte, which leaves no such
+      // margin: it does half the appends and checks the result only. The cases
+      // without a clock catch a quadratic join there.
+      test("a long run of appends to one name takes linear time", () => {
         const count = isDebug ? 4000 : 8000;
         const value = Buffer.alloc(4096, "x").toString();
         const headers = new Headers();
+        const started = performance.now();
         withoutAggressiveGC(() => {
           for (let i = 0; i < count; i++) headers.append("x-repeated", value);
         });
+        const elapsed = performance.now() - started;
         expect(headers.get("x-repeated")!.length).toBe(count * 4096 + (count - 1) * 2);
+        if (!isDebug) expect(elapsed).toBeLessThan(5000);
       });
     });
   });
