@@ -169,6 +169,8 @@ struct HttpResponseData : AsyncSocketData<SSL>, HttpParser {
         /* node:http: the peer sent its FIN first (HTTP_NODE_RECEIVED_FIN only covers a
          * deferred close). onSocketClosed reports it so the JS socket emits 'end'. */
         HTTP_NODE_PEER_ENDED = 1 << 22,
+        /* node:http socket.end() with outgoing bytes still queued: send the FIN when they have flushed, whether or not the response in flight has ended. The read side stays open. */
+        HTTP_NODE_SHUTDOWN_AFTER_DRAIN = 1 << 23,
 
         /* Bits that describe the connection rather than the response in flight.
          * There is one HttpResponseData per socket, reused by every request on a

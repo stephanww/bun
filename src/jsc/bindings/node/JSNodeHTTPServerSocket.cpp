@@ -358,6 +358,9 @@ static bool deferShutdownUntilResponseDrains(us_socket_t* socket, bool destroySo
     if (destroySoon) {
         /* And closes it there, even if the response never ends. */
         httpResponseData->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_CLOSE_AFTER_DRAIN;
+    } else {
+        /* The FIN follows them there, and the socket stays for the peer's FIN. */
+        httpResponseData->state |= uWS::HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN;
     }
     return true;
 }
@@ -1061,6 +1064,33 @@ extern "C" void Bun__NodeHTTP__onReadParsed(int ssl, us_socket_t* socket)
     }
     if (auto* res = serverSocket->currentResponseObject.get(); res != nullptr && res->m_ctx != nullptr) {
         Bun__NodeHTTPResponse_onReadParsed(res->m_ctx);
+    }
+}
+
+template<bool SSL>
+static bool prepareHalfCloseAfterDrain(us_socket_t* socket)
+{
+    auto* httpResponseData = reinterpret_cast<uWS::HttpResponseData<SSL>*>(us_socket_ext(socket));
+    /* halfClose() arms the reads whatever paused them. */
+    httpResponseData->state &= ~uWS::HttpResponseData<SSL>::HTTP_NODE_READS_PAUSED;
+    return (httpResponseData->state & uWS::HttpResponseData<SSL>::HTTP_NODE_PEER_ENDED) != 0;
+}
+
+// The bytes that a socket.end() waited for have left (HTTP_NODE_SHUTDOWN_AFTER_DRAIN). The socket can be closed when this returns.
+extern "C" void Bun__NodeHTTP__halfCloseAfterDrain(int ssl, us_socket_t* socket)
+{
+    if (us_socket_is_closed(socket)) {
+        return;
+    }
+    auto* serverSocket = ssl ? getNodeHTTPServerSocket<true>(socket) : getNodeHTTPServerSocket<false>(socket);
+    if (!serverSocket) {
+        return;
+    }
+    const bool peerEnded = ssl ? prepareHalfCloseAfterDrain<true>(socket) : prepareHalfCloseAfterDrain<false>(socket);
+    serverSocket->halfClose(serverSocket->globalObject());
+    /* Both sides have ended: no event is left to close the socket. */
+    if (peerEnded && !serverSocket->isClosed()) {
+        serverSocket->close();
     }
 }
 

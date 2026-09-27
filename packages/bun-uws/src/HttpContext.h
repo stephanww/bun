@@ -38,6 +38,7 @@
 
 extern "C" void Bun__NodeHTTP__onReadsResumable(int ssl, struct us_socket_t *s);
 extern "C" void Bun__NodeHTTP__onReadParsed(int ssl, struct us_socket_t *s);
+extern "C" void Bun__NodeHTTP__halfCloseAfterDrain(int ssl, struct us_socket_t *s);
 
 namespace uWS {
 
@@ -986,6 +987,17 @@ private:
                  * not the response in flight ever ends. */
                 if (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_CLOSE_AFTER_DRAIN) {
                     responseDone = true;
+                }
+                /* socket.end() issued while bytes were queued: Node half-closes
+                 * once they are out, whether or not the response in flight
+                 * ever ends, and keeps the socket until the peer's FIN. */
+                if (!responseDone
+                    && (httpResponseData->state & HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN)
+                    && httpResponseData->onWritable == nullptr
+                    && asyncSocket->hasFullyDrained()) {
+                    httpResponseData->state &= ~HttpResponseData<SSL>::HTTP_NODE_SHUTDOWN_AFTER_DRAIN;
+                    Bun__NodeHTTP__halfCloseAfterDrain(SSL, s);
+                    return s;
                 }
             }
             if (responseDone && asyncSocket->hasFullyDrained()) {
