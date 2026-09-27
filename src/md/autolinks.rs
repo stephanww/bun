@@ -92,7 +92,7 @@ pub struct AutolinkScanMemo {
     /// Marks of the host run up to `host_cut`.
     host_cut_marks: HostMarks,
     host_cut: usize,
-    /// The bytes behind the last alphanumeric in front of `tail_end` start at `tail_start`, `tail_run` is their first delimiter.
+    /// The delimiters and periods in front of `tail_end` start at `tail_start`, `tail_run` is the first delimiter.
     tail_end: usize,
     tail_start: usize,
     tail_run: usize,
@@ -184,7 +184,7 @@ impl AutolinkScanMemo {
         self.host_cut_marks.has(start, min)
     }
 
-    /// The first `*`, `_` or `~` of `content[from..=end]` that no alphanumeric follows in it.
+    /// The first `*`, `_` or `~` of the delimiters and periods that `content[from..end]` ends with, or the one at `end`.
     fn delimiter_in_tail(
         &mut self,
         content: &[u8],
@@ -199,9 +199,10 @@ impl AutolinkScanMemo {
                 run = base + end;
             }
             let mut pos = end;
-            while pos > from && !helpers::is_alpha_num(content[pos - 1]) {
+            while pos > from && (EMPH_DELIMS.contains(content[pos - 1]) || content[pos - 1] == b'.')
+            {
                 pos -= 1;
-                if EMPH_DELIMS.contains(content[pos]) {
+                if content[pos] != b'.' {
                     run = base + pos;
                 }
             }
@@ -581,9 +582,11 @@ fn scan_url_tail(
     let query = scan_url_component(content, Some(ctx), QUERY, path.end, 1);
     let frag = scan_url_component(content, Some(ctx), FRAGMENT, query.end, 1);
 
+    // The bytes from the run on are not in the link, so the byte behind them must be a boundary.
     let run = ctx
         .memo
-        .delimiter_in_tail(content, ctx.base, host_start, frag.end);
+        .delimiter_in_tail(content, ctx.base, host_start, frag.end)
+        .filter(|_| check_right_boundary(content, frag.end, Delims::Bytes));
     let end = match run {
         Some(run) => {
             let host = HostScan {
