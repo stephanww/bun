@@ -92,7 +92,7 @@ pub struct AutolinkScanMemo {
     /// Marks of the host run up to `host_cut`.
     host_cut_marks: HostMarks,
     host_cut: usize,
-    /// Of a slice that ends at `tail_limit`: the delimiters and periods in front of `tail_end` start at `tail_start`, `tail_run` is what `delimiter_in_tail` returns.
+    /// What `delimiter_in_tail` found for the scan end `tail_end` in the slice that ends at `tail_limit`.
     tail_limit: usize,
     tail_end: usize,
     tail_start: usize,
@@ -186,7 +186,7 @@ impl AutolinkScanMemo {
         self.host_cut_marks.has(start, min)
     }
 
-    /// The first delimiter of the delimiters and periods at the end of `content[from..end]` or at `end`, if the token has only punctuation from there on.
+    /// The delimiter run that ends a link whose scan ends at `end`, if the rest of the token is punctuation.
     fn delimiter_in_tail(
         &mut self,
         content: &[u8],
@@ -418,10 +418,12 @@ impl DelimiterBoundary<'_> {
     }
 }
 
+/// What can follow a link in its token: the trailing punctuation of GFM, quotes and closing brackets.
 const TRAILING_PUNCTUATION: ByteSet = ByteSet::of(b"*_~.,:;!?'\")]}");
+/// A token ends at whitespace, at '<' and at a backslash.
 const TOKEN_END: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C<\\");
 
-/// True if the token has only punctuation and entities from `pos` on. A token ends at whitespace, '<', '\\' and at a byte that is not ASCII, if that byte does not follow a '_'.
+/// True if the token has only punctuation and entities from `pos` on.
 fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
     let mut pos = pos;
     while pos < content.len() {
@@ -439,7 +441,9 @@ fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
     let Some(&c) = content.get(pos) else {
         return true;
     };
-    TOKEN_END.contains(c) || (!c.is_ascii() && (pos == 0 || content[pos - 1] != b'_'))
+    // A '_' in front of a letter is a part of the word, as it is between ASCII letters.
+    let in_word = pos > 0 && content[pos - 1] == b'_';
+    TOKEN_END.contains(c) || (!c.is_ascii() && !in_word)
 }
 
 /// Check left boundary for permissive autolinks.
@@ -649,7 +653,7 @@ struct HostScan {
     min_components: u32,
 }
 
-/// End of a link whose scan ends in the delimiter run at `run`: as in GFM, without the periods and the unbalanced ')' in front of the run.
+/// The end of a link in front of `run`, as in GFM without the periods and the unbalanced ')' there.
 fn end_at_delimiter_run(
     content: &[u8],
     host: HostScan,
