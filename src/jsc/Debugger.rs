@@ -132,6 +132,9 @@ pub struct Debugger {
     pub extension_agent: ErasedAgentSlot,
     pub http_server_agent: HTTPServerAgent,
     pub must_block_until_connected: bool,
+    /// `wait_for_node_inspector_connection` is on the stack. Code that the
+    /// frontend evaluates inside that wait can call it again.
+    pub waiting_for_node_inspector: bool,
 }
 
 impl Default for Debugger {
@@ -151,6 +154,7 @@ impl Default for Debugger {
             extension_agent: ErasedAgentSlot::default(),
             http_server_agent: HTTPServerAgent::default(),
             must_block_until_connected: false,
+            waiting_for_node_inspector: false,
         }
     }
 }
@@ -161,6 +165,7 @@ impl Default for Debugger {
 unsafe extern "C" {
     safe fn Bun__createJSDebugger(global: &JSGlobalObject) -> u32;
     safe fn Bun__ensureDebugger(ctx_id: u32, wait: bool);
+    safe fn BunDebugger__drainOrPark(ctx_id: u32);
     safe fn Bun__startJSDebuggerThread(
         global: &JSGlobalObject,
         ctx_id: u32,
@@ -186,9 +191,15 @@ struct DebuggerThreadInit {
 }
 
 impl Debugger {
-    /// `Debugger.waitForDebuggerIfNecessary(vm)` — block on the futex until
-    /// `start()` (debugger thread) signals, then run the wait-loop until a
-    /// frontend connects (`Debugger__didConnect`) or the deadline elapses.
+    /// The startup wait of `--inspect-wait`, `--inspect-brk` and `BUN_INSPECT`:
+    /// block on the futex until `start()` (debugger thread) signals, then run
+    /// the event loop until a frontend connects (`Debugger__didConnect`) or
+    /// the deadline elapses.
+    ///
+    /// It runs the event loop, so it is only for a caller with no JavaScript
+    /// on the stack. `--redis-preconnect` and `--sql-preconnect` finish their
+    /// handshakes in it. A wait that JavaScript can call is
+    /// [`wait_for_node_inspector_connection`], which does not.
     ///
     /// Aliasing: `this.debugger` is read through a raw pointer
     /// with fresh short-lived borrows because `event_loop().tick()` /
@@ -211,6 +222,10 @@ impl Debugger {
         if !dbg.must_block_until_connected {
             return;
         }
+        debug_assert!(
+            !this.jsc_vm().is_entered(),
+            "the startup wait for a debugger runs the event loop: it must not be called with JavaScript on the stack",
+        );
         let (ctx_id, wait) = (dbg.script_execution_context_id, dbg.wait_for_connection);
         // Reset `must_block_until_connected` on every exit path.
         let _reset = scopeguard::guard((), |()| {
@@ -586,10 +601,9 @@ pub fn start_node_inspector_server(url: &mut BunString, wait_for_connection: boo
         return false;
     }
 
-    // Install Bun's controller before any yield can let a client
-    // connectFrontend() to JSC's default one; the waiting path's later call
-    // from wait_for_debugger_if_necessary is then a bunControllerInstalled
-    // no-op that only handles the block.
+    // Install Bun's controller before a client can connectFrontend() to JSC's
+    // default one. The later call from wait_for_node_inspector_connection
+    // finds it installed and only arms the wait.
     let ctx_id = match this.debugger.as_deref() {
         Some(d) => d.script_execution_context_id,
         None => return false,
@@ -599,26 +613,54 @@ pub fn start_node_inspector_server(url: &mut BunString, wait_for_connection: boo
     true
 }
 
-/// `inspector.open(port, host, true)` / `inspector.waitForDebugger()` — block,
-/// ticking the event loop, until a frontend connects to the inspector.
+/// `inspector.open(port, host, true)` / `inspector.waitForDebugger()`: block
+/// the thread until a frontend sends `Runtime.runIfWaitingForDebugger`.
+///
+/// The event loop does not run. The frontend's messages are queued by the
+/// debugger thread and delivered here, so the only JavaScript that runs
+/// inside the call is what the frontend evaluates.
 // HOST_EXPORT(Debugger__waitForNodeInspectorConnection, c)
 pub fn wait_for_node_inspector_connection() {
-    // Node blocks on every waitForDebugger() call for a fresh
-    // Runtime.runIfWaitingForDebugger, even if a frontend already resolved a
-    // previous wait — see test-inspector-wait-for-connection.js.
     let this = VirtualMachine::get();
-    {
+    let ctx_id = {
         let Some(dbg) = this.debugger_mut() else {
             return;
         };
+        bun_analytics::features::debugger.fetch_add(1, Ordering::Relaxed);
+        if dbg.waiting_for_node_inspector {
+            return;
+        }
+        dbg.waiting_for_node_inspector = true;
+        // Node blocks on every waitForDebugger() call for a fresh
+        // Runtime.runIfWaitingForDebugger, even if a frontend already resolved a
+        // previous wait. See test-inspector-wait-for-connection.js.
         if dbg.wait_for_connection == Wait::Off {
             // Mirror `create()`: the ref pairs with the unref in `did_connect`.
             dbg.wait_for_connection = Wait::Forever;
             dbg.poll_ref.ref_(get_vm_ctx(AllocatorType::Js));
         }
-        dbg.must_block_until_connected = true;
+        dbg.script_execution_context_id
+    };
+    // `create()` sets `must_block_until_connected` for `open(port, host, true)`.
+    // Left set, the next startup wait (a hot reload, the next test file) blocks.
+    let _reset = scopeguard::guard((), |()| {
+        if let Some(dbg) = VirtualMachine::get().debugger_mut() {
+            dbg.waiting_for_node_inspector = false;
+            dbg.must_block_until_connected = false;
+        }
+    });
+
+    Bun__ensureDebugger(ctx_id, true);
+
+    // The debugger is borrowed again on every pass: the code that the frontend
+    // evaluates runs inside the step and can change it.
+    while this
+        .debugger
+        .as_deref()
+        .is_some_and(|dbg| dbg.wait_for_connection != Wait::Off)
+    {
+        BunDebugger__drainOrPark(ctx_id);
     }
-    Debugger::wait_for_debugger_if_necessary(VirtualMachine::get_mut_ptr());
 }
 
 /// The debugger thread reported that `Bun.serve` failed (e.g. EADDRINUSE) —

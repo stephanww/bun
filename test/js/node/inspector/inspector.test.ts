@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { bunEnv, bunExe, tempDir } from "harness";
 import inspector from "node:inspector";
 
@@ -551,6 +551,435 @@ test("inspector.waitForDebugger() blocks again on the second call after a fronte
   expect(exitCode).toBe(0);
 });
 
+// inspector.waitForDebugger() and inspector.open(port, host, true) block the
+// thread, like Node: the event loop does not run while they wait, so nothing
+// that the program scheduled runs before they return. The only JavaScript that
+// runs inside them is what the client evaluates.
+//
+// Every fixture arms one callback of each kind before the call. The microtask
+// and the nextTick make a loop that does run show up every time: one turn of
+// it drains them, however early the client resumes the process.
+const waitFixturePreamble = `
+import inspector from "node:inspector";
+
+// On the global object, for the expressions that the client evaluates.
+globalThis.inspectorOfTheProgram = inspector;
+globalThis.insideTheCall = false;
+const ranInsideTheCall = [];
+const record = what => {
+  if (globalThis.insideTheCall) ranInsideTheCall.push(what);
+};
+
+// One byte of the program's own socket traffic, readable when the call starts.
+const listener = Bun.listen({
+  hostname: "127.0.0.1",
+  port: 0,
+  socket: { data: () => record("socket data") },
+});
+const opened = Promise.withResolvers();
+Bun.connect({
+  hostname: "127.0.0.1",
+  port: listener.port,
+  socket: { open: socket => opened.resolve(socket), data() {} },
+});
+const client = await opened.promise;
+
+function insideTheCall(call) {
+  client.write("x");
+  setTimeout(() => record("timer"), 0);
+  setImmediate(() => record("setImmediate"));
+  process.nextTick(() => record("nextTick"));
+  queueMicrotask(() => record("microtask"));
+  Bun.file(import.meta.path)
+    .text()
+    .then(() => record("file read"));
+
+  process.stderr.write("BEFORE_THE_CALL\\n");
+  globalThis.insideTheCall = true;
+  call();
+  globalThis.insideTheCall = false;
+}
+
+// close() comes first: the debugger thread then frees the sockets of the
+// frontends that left.
+function finish(more = {}) {
+  console.log(JSON.stringify({ ranInsideTheCall: ranInsideTheCall.sort(), ...more }));
+  inspector.close();
+  process.exit(0);
+}
+`;
+
+const nothingRan = { ranInsideTheCall: [] };
+
+// A case that times out does not reach its dispose, and a child that waits
+// for a debugger does not exit by itself.
+const inspectedChildren = new Set<ReturnType<typeof Bun.spawn>>();
+afterAll(() => {
+  for (const child of inspectedChildren) child.kill();
+});
+
+/**
+ * Spawns the fixture and reads its stderr until the child is inside the call.
+ * The URL to attach to is the last one that the child printed: before the call
+ * for waitForDebugger(), inside it for open(port, host, true).
+ */
+async function spawnInspected(fixture: string, urlIsPrintedInsideTheCall: boolean, files: Record<string, string> = {}) {
+  const dir = tempDir("inspector-wait", { "fixture.mjs": waitFixturePreamble + fixture, ...files });
+  const proc = Bun.spawn({
+    cmd: [bunExe(), "fixture.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  inspectedChildren.add(proc);
+
+  const decoder = new TextDecoder();
+  const reader = proc.stderr.getReader();
+  let stderrText = "";
+  let wsUrl: string | undefined;
+  while (!wsUrl) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error(`stderr closed before the child was inside the call: ${stderrText}`);
+    stderrText += decoder.decode(value, { stream: true });
+    const marker = stderrText.indexOf("BEFORE_THE_CALL\n");
+    if (marker === -1) continue;
+    const printed = urlIsPrintedInsideTheCall ? stderrText.slice(marker) : stderrText.slice(0, marker);
+    wsUrl = [...printed.matchAll(/Debugger listening on (ws:\S+)\n/g)].at(-1)?.[1];
+    if (!wsUrl && !urlIsPrintedInsideTheCall) throw new Error(`no inspector URL before the call: ${stderrText}`);
+  }
+  const drained = (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      stderrText += decoder.decode(value, { stream: true });
+    }
+  })();
+
+  return {
+    proc,
+    wsUrl,
+    stderr: () => stderrText,
+    /** What the program reported after the call returned, and its exit code. */
+    async finished() {
+      const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+      await drained;
+      const line = stdout.trim().split("\n").at(-1)!;
+      return { reported: line ? JSON.parse(line) : stdout, exitCode };
+    },
+    async [Symbol.asyncDispose]() {
+      proc.kill();
+      await proc.exited;
+      inspectedChildren.delete(proc);
+      dir[Symbol.dispose]();
+    },
+  };
+}
+
+/** A DevTools client. Every wait on it rejects when the socket or the child is lost. */
+async function attachFrontend(inspected: Awaited<ReturnType<typeof spawnInspected>>) {
+  const ws = new WebSocket(inspected.wsUrl);
+  const opened = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  const replies = new Map<number, PromiseWithResolvers<any>>();
+  const notifications = new Map<string, PromiseWithResolvers<any>>();
+  let nextId = 1;
+
+  // A wait that nobody is in when the socket is lost must not fail the test.
+  const watched = <T>(resolvers: PromiseWithResolvers<T>) => {
+    resolvers.promise.catch(() => {});
+    return resolvers;
+  };
+  const notification = (method: string) => {
+    let entry = notifications.get(method);
+    if (!entry) notifications.set(method, (entry = watched(Promise.withResolvers())));
+    return entry;
+  };
+  const lost = (why: string) => {
+    const error = new Error(`${why}; stderr: ${inspected.stderr()}`);
+    opened.reject(error);
+    for (const reply of replies.values()) reply.reject(error);
+    for (const entry of notifications.values()) entry.reject(error);
+  };
+
+  watched(opened);
+  ws.onopen = () => opened.resolve();
+  ws.onerror = () => lost("the inspector websocket errored");
+  ws.onclose = () => {
+    closed.resolve();
+    lost("the inspector websocket closed");
+  };
+  ws.onmessage = event => {
+    const message = JSON.parse(String(event.data));
+    if (message.id != null) replies.get(message.id)?.resolve(message);
+    else notification(message.method).resolve(message.params);
+  };
+  inspected.proc.exited.then(code => lost(`the child exited with code ${code}`));
+  await opened.promise;
+
+  return {
+    /** Sends a command. The promise is its reply. */
+    send(method: string, params: unknown = {}) {
+      const id = nextId++;
+      const reply = watched(Promise.withResolvers<any>());
+      replies.set(id, reply);
+      ws.send(JSON.stringify({ id, method, params }));
+      return reply.promise;
+    },
+    notified: (method: string) => notification(method).promise,
+    async close() {
+      ws.close();
+      await closed.promise;
+    },
+  };
+}
+
+const evaluate = (expression: string) => ["Runtime.evaluate", { expression }] as const;
+
+test.concurrent.each([
+  ["inspector.waitForDebugger()", `inspector.open(0, "127.0.0.1");`, `inspector.waitForDebugger()`, false],
+  ["inspector.open(port, host, true)", ``, `inspector.open(0, "127.0.0.1", true)`, true],
+  [
+    "inspector.open(port, host, true) after a close()",
+    `inspector.open(0, "127.0.0.1"); inspector.close();`,
+    `inspector.open(0, "127.0.0.1", true)`,
+    true,
+  ],
+])("%s does not run the event loop while it waits", async (_name, setup, call, urlIsPrintedInsideTheCall) => {
+  await using inspected = await spawnInspected(
+    `
+${setup}
+insideTheCall(() => ${call});
+finish({ evaluatedByClient: globalThis.evaluatedByClient });
+`,
+    urlIsPrintedInsideTheCall,
+  );
+
+  const frontend = await attachFrontend(inspected);
+  // The reply can only come from inside the call: the program is still in
+  // it, and it stays there until the client resumes it below.
+  await frontend.send(...evaluate("globalThis.evaluatedByClient = 'inside the call: ' + globalThis.insideTheCall"));
+  frontend.send("Runtime.runIfWaitingForDebugger");
+
+  expect(await inspected.finished()).toEqual({
+    reported: { ...nothingRan, evaluatedByClient: "inside the call: true" },
+    exitCode: 0,
+  });
+});
+
+// The call is made from an I/O callback while a second socket is readable. A
+// wait that polls the loop would run the second callback inside the first.
+test.concurrent(
+  "inspector.waitForDebugger() from a socket callback does not run the callback of another socket",
+  async () => {
+    await using inspected = await spawnInspected(
+      `
+inspector.open(0, "127.0.0.1");
+
+const order = [];
+const done = Promise.withResolvers();
+const log = what => {
+  order.push(what);
+  if (order.length === 5) done.resolve();
+};
+
+let sockets = 0;
+const pair = Bun.listen({
+  hostname: "127.0.0.1",
+  port: 0,
+  socket: {
+    data() {
+      if (++sockets === 2) return log("second data");
+      log("first data");
+      queueMicrotask(() => log("microtask"));
+      setTimeout(() => log("timer"), 0);
+      insideTheCall(() => inspector.waitForDebugger());
+      log("returned");
+    },
+  },
+});
+for (let i = 0; i < 2; i++) {
+  const connected = Promise.withResolvers();
+  Bun.connect({
+    hostname: "127.0.0.1",
+    port: pair.port,
+    socket: { open: socket => connected.resolve(socket), data() {} },
+  });
+  (await connected.promise).write("x");
+}
+
+await done.promise;
+const returned = order.indexOf("returned");
+finish({ beforeItReturned: order.slice(0, returned), afterItReturned: order.slice(returned + 1).sort() });
+`,
+      false,
+    );
+
+    const frontend = await attachFrontend(inspected);
+    frontend.send("Runtime.runIfWaitingForDebugger");
+
+    expect(await inspected.finished()).toEqual({
+      reported: {
+        ...nothingRan,
+        beforeItReturned: ["first data"],
+        afterItReturned: ["microtask", "second data", "timer"],
+      },
+      exitCode: 0,
+    });
+  },
+);
+
+// The first frontend leaves without resuming the program. Its disconnect is
+// finished inside the wait, before the second frontend attaches. Finished
+// after the wait, it would reset the Debugger domain that the second frontend
+// enabled, and the program would run past the debugger statement.
+test.concurrent(
+  "inspector.waitForDebugger() keeps waiting when a frontend leaves, and the next one can pause the program",
+  async () => {
+    await using inspected = await spawnInspected(
+      `
+inspector.open(0, "127.0.0.1");
+insideTheCall(() => inspector.waitForDebugger());
+const { afterTheStatement } = await import("./paused.mjs");
+finish({ afterTheStatement });
+`,
+      false,
+      { "paused.mjs": `debugger;\nexport const afterTheStatement = true;\n` },
+    );
+
+    const first = await attachFrontend(inspected);
+    await first.send("Debugger.enable");
+    await first.close();
+
+    const second = await attachFrontend(inspected);
+    await second.send("Runtime.enable");
+    await second.send("Debugger.enable");
+    const paused = second.notified("Debugger.paused");
+    await second.send("Runtime.runIfWaitingForDebugger");
+    expect((await paused).reason).toBe("other");
+    second.send("Debugger.resume");
+
+    expect(await inspected.finished()).toEqual({
+      reported: { ...nothingRan, afterTheStatement: true },
+      exitCode: 0,
+    });
+  },
+);
+
+test.concurrent(
+  "inspector.waitForDebugger() returns when the client resumes the program and closes its socket at once",
+  async () => {
+    await using inspected = await spawnInspected(
+      `
+inspector.open(0, "127.0.0.1");
+insideTheCall(() => inspector.waitForDebugger());
+finish();
+`,
+      false,
+    );
+
+    const frontend = await attachFrontend(inspected);
+    frontend.send("Runtime.runIfWaitingForDebugger");
+    await frontend.close();
+
+    expect(await inspected.finished()).toEqual({ reported: nothingRan, exitCode: 0 });
+  },
+);
+
+// Node returns at once from a waitForDebugger() that runs inside another one.
+// A nested call that waited would see the second expression run inside it.
+// The client sends that expression when the first one has begun, so the two
+// are never delivered in one batch.
+test.concurrent("inspector.waitForDebugger() that the client evaluates inside the wait returns at once", async () => {
+  await using inspected = await spawnInspected(
+    `
+globalThis.evaluated = [];
+inspector.open(0, "127.0.0.1");
+insideTheCall(() => inspector.waitForDebugger());
+finish({ evaluated: globalThis.evaluated });
+`,
+    false,
+  );
+
+  const frontend = await attachFrontend(inspected);
+  await frontend.send("Runtime.enable");
+  const began = frontend.notified("Runtime.consoleAPICalled");
+  frontend.send(
+    ...evaluate(
+      "console.log('began'); globalThis.inspectorOfTheProgram.waitForDebugger(); globalThis.evaluated.push('the nested call')",
+    ),
+  );
+  await began;
+  await frontend.send(...evaluate("globalThis.evaluated.push('the next expression')"));
+  frontend.send("Runtime.runIfWaitingForDebugger");
+
+  expect(await inspected.finished()).toEqual({
+    reported: { ...nothingRan, evaluated: ["the nested call", "the next expression"] },
+    exitCode: 0,
+  });
+});
+
+// A breakpoint pause is an inspector wait too. The last resume is for a build
+// that waits inside the pause: it ends that wait, so the case fails on the
+// order of the two expressions and not on a timeout.
+test.concurrent("inspector.waitForDebugger() that the client evaluates at a breakpoint returns at once", async () => {
+  await using inspected = await spawnInspected(
+    `
+globalThis.evaluated = [];
+inspector.open(0, "127.0.0.1");
+insideTheCall(() => inspector.waitForDebugger());
+await import("./paused.mjs");
+finish({ evaluated: globalThis.evaluated });
+`,
+    false,
+    { "paused.mjs": `debugger;\n` },
+  );
+
+  const frontend = await attachFrontend(inspected);
+  await frontend.send("Runtime.enable");
+  await frontend.send("Debugger.enable");
+  const paused = frontend.notified("Debugger.paused");
+  await frontend.send("Runtime.runIfWaitingForDebugger");
+  await paused;
+
+  const began = frontend.notified("Runtime.consoleAPICalled");
+  frontend.send(
+    ...evaluate(
+      "console.log('began'); globalThis.inspectorOfTheProgram.waitForDebugger(); globalThis.evaluated.push('the nested call')",
+    ),
+  );
+  await began;
+  await frontend.send(...evaluate("globalThis.evaluated.push('the next expression')"));
+  frontend.send("Runtime.runIfWaitingForDebugger");
+  frontend.send("Debugger.resume");
+
+  expect(await inspected.finished()).toEqual({
+    reported: { ...nothingRan, evaluated: ["the nested call", "the next expression"] },
+    exitCode: 0,
+  });
+});
+
+// No frontend can reach a stopped server to resume the program, so the wait
+// ends with it. Node closes the socket and stays in the wait.
+test.concurrent("inspector.waitForDebugger() returns when the client evaluates inspector.close()", async () => {
+  await using inspected = await spawnInspected(
+    `
+inspector.open(0, "127.0.0.1");
+insideTheCall(() => inspector.waitForDebugger());
+finish({ url: String(inspector.url()) });
+`,
+    false,
+  );
+
+  const frontend = await attachFrontend(inspected);
+  frontend.send(...evaluate("globalThis.inspectorOfTheProgram.close()"));
+
+  expect(await inspected.finished()).toEqual({
+    reported: { ...nothingRan, url: "undefined" },
+    exitCode: 0,
+  });
+});
+
 test("Runtime.consoleAPICalled is emitted while the Runtime domain is enabled", () => {
   const session = new inspector.Session();
   session.connect();
@@ -882,9 +1311,9 @@ export { after };
 // a module containing `debugger;`, and the client resumes the pause.
 test("breakpoints pause and resume over the inspector.open() DevTools server", async () => {
   using dir = tempDir("inspector-breakpoints", {
-    // wait=true blocks the inspected thread in waitForDebugger()'s tick loop
-    // until Runtime.runIfWaitingForDebugger, so Debugger.enable is guaranteed
-    // to have armed setPauseOnDebuggerStatements before mod.mjs evaluates.
+    // wait=true blocks the inspected thread inside open() until
+    // Runtime.runIfWaitingForDebugger, so Debugger.enable is guaranteed to
+    // have armed setPauseOnDebuggerStatements before mod.mjs evaluates.
     "entry.mjs": `
 import inspector from "node:inspector";
 let beforeOpen = 1;
