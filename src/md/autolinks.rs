@@ -419,9 +419,9 @@ impl Delims<'_> {
 }
 
 const TRAILING_PUNCTUATION: ByteSet = ByteSet::of(b"*_~.,:;!?'\")]}");
-const TOKEN_END: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C<");
+const TOKEN_END: ByteSet = ByteSet::of(b" \t\n\r\x0B\x0C<\\");
 
-/// True if the token has only punctuation and entities from `pos` on. A token ends at whitespace, at '<' and at a byte that is not ASCII.
+/// True if the token has only punctuation and entities from `pos` on. A token ends at whitespace, '<', '\\' and at a byte that is not ASCII, if that byte does not follow a '_'.
 fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
     let mut pos = pos;
     while pos < content.len() {
@@ -436,7 +436,10 @@ fn token_ends_with_punctuation(content: &[u8], pos: usize) -> bool {
             None => break,
         }
     }
-    pos >= content.len() || TOKEN_END.contains(content[pos]) || !content[pos].is_ascii()
+    let Some(&c) = content.get(pos) else {
+        return true;
+    };
+    TOKEN_END.contains(c) || (!c.is_ascii() && (pos == 0 || content[pos - 1] != b'_'))
 }
 
 /// Check left boundary for permissive autolinks.
