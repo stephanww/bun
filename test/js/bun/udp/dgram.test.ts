@@ -2,7 +2,7 @@ import { describe, expect, jest, test } from "bun:test";
 import { createSocket } from "dgram";
 import { Worker } from "node:worker_threads";
 
-import { bunEnv, bunExe, bunRun, disableAggressiveGCScope, isWindows } from "harness";
+import { bunEnv, bunExe, bunRun, disableAggressiveGCScope, isLinux, isWindows } from "harness";
 import path from "path";
 import { nodeDataCases } from "./testdata";
 
@@ -261,6 +261,16 @@ describe.skipIf(isWindows)("cluster", () => {
     expect(stdout).toStartWith("ok: all 4 workers adopted and released the shared descriptor ");
     expect(exitCode).toBe(0);
   }, 40_000);
+
+  // A worker reads a shared descriptor one datagram per receive call. The
+  // bound of a readable event counts datagrams, not calls, so a backlog still
+  // arrives 32 to a loop turn, as it does in Node.
+  test("a shared socket hands over at most 32 datagrams per readable event", async () => {
+    const { stdout, stderr, exitCode } = await runClusterFixture("dgram-cluster-recv-budget-fixture.ts", 20_000);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toMatchObject({ total: 100, max: 32 });
+    expect(exitCode).toBe(0);
+  }, 30_000);
 });
 
 describe("after close()", () => {
@@ -914,6 +924,62 @@ for (const [kind, bind] of Object.entries(icmpBindModes)) {
     socket.close();
   });
 }
+
+// A readable event used to read until the socket was empty, so a peer that
+// kept the queue non-empty kept the loop inside that one event. It now hands
+// over at most 32 datagrams, as libuv does, and the rest waits for the next
+// turn of the loop. Each scenario of the fixture queues its backlog before the
+// loop polls and reports what every turn delivered.
+describe.concurrent("a readable event hands over at most 32 datagrams", () => {
+  async function perTurn(scenario: string) {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), path.join(import.meta.dir, "udp-recv-budget-fixture.ts"), scenario],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, rawStderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const stderr = rawStderr
+      .split("\n")
+      .filter(l => l && !l.startsWith("WARNING: ASAN interferes"))
+      .join("\n");
+    expect({ stderr, exitCode }).toEqual({ stderr: "", exitCode: 0 });
+    return JSON.parse(stdout);
+  }
+
+  test("of a backlog of 100", async () => {
+    expect(await perTurn("dgram-backlog")).toMatchObject({ total: 100, max: 32 });
+  });
+
+  test("of each socket", async () => {
+    expect(await perTurn("dgram-two-sockets")).toMatchObject({ total: 200, max: 64 });
+  });
+
+  // An event that stops at its bound has not seen the receive fail and has not
+  // seen it run dry, which were the two answers that kept a socket with
+  // EPOLLERR open. EPOLLERR can be stale: a send from an earlier callback of
+  // the same turn takes the pending error. The socket has to stay open then.
+  describe.skipIf(!isLinux)("and keeps the socket open when a send took the pending error", () => {
+    // A descriptor bun did not create has no error queue to find a report on.
+    test("of an adopted descriptor", async () => {
+      expect(await perTurn("residual-adopted")).toMatchObject({
+        residual: true,
+        closed: false,
+        total: 40,
+        max: 32,
+      });
+    });
+
+    // The kernel queues the report only when the receive buffer has room.
+    test("of a socket with a full receive buffer", async () => {
+      const result = await perTurn("residual-full-buffer");
+      expect(result).toMatchObject({ residual: true, closed: false, max: 32 });
+      // More than one event's worth arrived, and the buffer did overflow.
+      expect(result.total).toBeGreaterThan(32);
+      expect(result.total).toBeLessThan(result.sent);
+    });
+  });
+});
 
 // A worker that calls process.exit() from the FIRST 'message' of a batch
 // leaves a TerminationException pending for the rest of that poll dispatch:

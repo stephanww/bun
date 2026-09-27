@@ -990,7 +990,23 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int eof, in
             if (error) {
                 struct msghdr eh; char ectrl[512]; char ebuf[1];
                 struct iovec eiov = { ebuf, sizeof(ebuf) };
+                /* Bounded like the data loop below, and for the same reason:
+                 * a handler that sends again to the dead port has the next
+                 * report queued before the next recvmsg here. */
+                int errqueue_budget = LIBUS_UDP_MAX_RECV_PER_EVENT;
                 while (!u->closed) {
+                    if (errqueue_budget-- == 0) {
+                        /* Dequeuing a report leaves sk_err holding the errno
+                         * of the one queued behind it; only the last dequeue
+                         * clears it. Stopping early must clear it too, or the
+                         * recvmmsg below fails with it and reports an error
+                         * that a full drain never reports. The reports stay
+                         * queued and raise EPOLLERR again. */
+                        int pending_error = 0;
+                        socklen_t pending_error_length = sizeof(pending_error);
+                        (void) getsockopt(us_poll_fd(p), SOL_SOCKET, SO_ERROR, &pending_error, &pending_error_length);
+                        break;
+                    }
                     memset(&eh, 0, sizeof(eh));
                     eh.msg_iov = &eiov; eh.msg_iovlen = 1;
                     eh.msg_control = ectrl; eh.msg_controllen = sizeof(ectrl);
@@ -1024,22 +1040,22 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int eof, in
 #else
             const int run_recv = events & LIBUS_SOCKET_READABLE;
 #endif
+            /* Reading until EAGAIN lets the peer decide when this loop ends: a
+             * sender at or above the rate on_data drains at, or one that
+             * answers what on_data sends, keeps the queue non-empty, and no
+             * timer, immediate or other poll runs until it stops. The poll is
+             * level-triggered on every backend, so what is left raises the
+             * next event. */
+            int recv_budget = LIBUS_UDP_MAX_RECV_PER_EVENT;
             if (run_recv && !u->closed) {
-
-                /* Bound one readable dispatch: a peer sending at or above our
-                 * drain rate otherwise keeps recvmmsg returning data forever
-                 * and this loop never exits - timers, every other socket and
-                 * the pre/post callbacks starve. libuv caps a UDP dispatch at
-                 * 32 datagrams ("Prevent loop starvation", unix/udp.c); 4
-                 * batches of LIBUS_UDP_RECV_COUNT(8) matches that. Leftover
-                 * data redelivers on the next tick (level-triggered/persistent
-                 * readable on all three backends). */
-                int recv_batches = 4;
                 do {
                     struct udp_recvbuf recvbuf;
                     bsd_udp_setup_recvbuf(&recvbuf, u->loop->data.recv_buf, LIBUS_RECV_BUFFER_LENGTH);
-                    int npackets = bsd_recvmmsg(us_poll_fd(p), &recvbuf, MSG_DONTWAIT, u->shared_fd ? 1 : LIBUS_UDP_RECV_COUNT);
+                    int max_packets = u->shared_fd ? 1 : LIBUS_UDP_RECV_COUNT;
+                    if (max_packets > recv_budget) max_packets = recv_budget;
+                    int npackets = bsd_recvmmsg(us_poll_fd(p), &recvbuf, MSG_DONTWAIT, max_packets);
                     if (npackets > 0) {
+                        recv_budget -= npackets;
                         u->on_data(u, &recvbuf, npackets);
                     } else {
                         if (npackets == LIBUS_SOCKET_ERROR) {
@@ -1086,7 +1102,7 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int eof, in
 
                         break;
                     }
-                } while (!u->closed && --recv_batches);
+                } while (!u->closed && recv_budget > 0);
             }
 
             if (events & LIBUS_SOCKET_WRITABLE && !u->closed) {
@@ -1109,8 +1125,9 @@ void us_internal_dispatch_ready_poll(struct us_poll_t *p, int error, int eof, in
              * EAGAIN (which means the error queue is already drained,
              * leaving a residual EPOLLERR). Otherwise the socket stays
              * open so the user can keep sending/receiving after a
-             * transient ICMP error. */
-            if (error && !recv_error_surfaced && !recv_would_block_only && !u->closed) {
+             * transient ICMP error. A read that stopped on its budget never
+             * got as far as either answer: the next event decides. */
+            if (error && !recv_error_surfaced && !recv_would_block_only && recv_budget > 0 && !u->closed) {
                 us_udp_socket_close(u);
             }
 #else

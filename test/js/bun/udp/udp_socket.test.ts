@@ -7,6 +7,7 @@ import {
   disableAggressiveGCScope,
   expectRssDeltaBelow,
   isIPv6,
+  isLinux,
   isWindows,
   randomPort,
   tempDir,
@@ -673,6 +674,59 @@ describe("udpSocket()", () => {
     expect(exitCode).toBe(0);
   });
 
+  // A readable event used to read until the socket was empty. A peer that
+  // sends as fast as the data handler drains, or that answers what the handler
+  // sends, then kept the loop inside that one event: no timer, no immediate
+  // and no other socket ran until the peer stopped. An event now hands over at
+  // most 32 datagrams, the count libuv uses, and the rest waits for the next
+  // turn of the loop. Each scenario of the fixture queues its backlog before
+  // the loop polls and reports what every turn delivered.
+  describe.concurrent("a readable event hands over at most 32", () => {
+    async function perTurn(scenario: string) {
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), path.join(import.meta.dir, "udp-recv-budget-fixture.ts"), scenario],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, rawStderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      const stderr = rawStderr
+        .split("\n")
+        .filter(l => l && !l.startsWith("WARNING: ASAN interferes"))
+        .join("\n");
+      expect({ stderr, exitCode }).toEqual({ stderr: "", exitCode: 0 });
+      return JSON.parse(stdout);
+    }
+
+    test("datagrams of a backlog of 100", async () => {
+      expect(await perTurn("backlog")).toMatchObject({ total: 100, max: 32 });
+    });
+
+    // The first batch of the event is short, so the last one has to ask for
+    // what is left of the 32 and not for a full batch.
+    test("datagrams when the data handler queues more on its own socket", async () => {
+      expect(await perTurn("refill")).toMatchObject({ total: 107, max: 32 });
+    });
+
+    // Linux reports an ICMP error for an earlier send on the socket's error
+    // queue, and the same event drains that queue before it reads data.
+    test.skipIf(!isLinux)("error reports when the error handler sends again", async () => {
+      expect(await perTurn("error-storm")).toMatchObject({ total: 100, max: 32, untagged: 0 });
+    });
+
+    // An error without `errqueue` is a receive that failed. A drain that stops
+    // at its bound leaves reports queued, and they must not fail the receive.
+    test.skipIf(!isLinux)("error reports, and the receive after them still succeeds", async () => {
+      expect(await perTurn("error-backlog")).toMatchObject({
+        reports: 40,
+        total: 40,
+        max: 32,
+        untagged: 0,
+        received: 10,
+      });
+    });
+  });
+
   // sendMany() iterates the input array and may run user JS (array index
   // getters, port `valueOf()`, address `toString()`). That user JS can
   // connect or disconnect the socket; sendMany must snapshot the connection
@@ -803,27 +857,6 @@ test("sendMany() sends every packet of a larger-than-one-batch call", async () =
     server.close();
   }
 });
-
-// The recv dispatch used to loop until EAGAIN, so a peer sending at or above
-// our drain rate kept the kernel queue non-empty and starved the entire event
-// loop (no timers, no other sockets). It is now bounded per dispatch like
-// libuv (32 datagrams); leftover data redelivers on the next tick.
-test("sustained inbound flood must not starve the event loop", async () => {
-  await using proc = Bun.spawn({
-    cmd: [bunExe(), path.join(import.meta.dir, "udp-flood-starvation-fixture.ts")],
-    env: bunEnv,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const [stdout, rawStderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-  const stderr = rawStderr
-    .split("\n")
-    .filter(l => l && !l.startsWith("WARNING: ASAN interferes"))
-    .join("\n");
-  expect(stderr).toBe("");
-  expect(stdout).toMatch(/interval fired \d+ times during 2s of flood/);
-  expect(exitCode).toBe(0);
-}, 30_000);
 
 test("udpSocket({ hostname }) does not leak the hostname", async () => {
   const code = /* js */ `
