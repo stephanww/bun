@@ -3234,7 +3234,10 @@ pub mod formatter {
                 self.map = core::mem::take(data);
                 self.map_node = Some(node);
             }
-            self.map.get_or_put(value).expect("unreachable").found_existing
+            self.map
+                .get_or_put(value)
+                .expect("unreachable")
+                .found_existing
         }
 
         /// Ends the record that `visited_enter` made for `value`.
